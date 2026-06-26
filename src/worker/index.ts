@@ -1,0 +1,388 @@
+import { Env, SSHConnectionConfig } from '../types';
+import { HTML } from './html';
+import {
+  handleGitHubAuth,
+  handleGitHubCallback,
+  handleLogout,
+  handleGetMe,
+  getAuthenticatedUser,
+} from './auth';
+
+export { SSHSessionDO } from './durable-object';
+export { UserDBDO } from './user-db';
+
+const RATE_LIMIT_MAX = 10;      // max requests per window
+const RATE_LIMIT_WINDOW = 60000; // 1 minute window
+
+// 分布式速率限制（使用 Durable Object）
+async function isDistributedRateLimited(env: Env, ip: string): Promise<boolean> {
+  try {
+    const stub = getUserDBStub(env);
+    const response = await stub.fetch(new Request('http://internal/internal/rate-limit/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ip, maxRequests: RATE_LIMIT_MAX, windowMs: RATE_LIMIT_WINDOW }),
+    }));
+
+    if (!response.ok) return false;
+    const result = await response.json<{ limited: boolean }>();
+    return result.limited;
+  } catch {
+    return false;
+  }
+}
+
+async function verifyTurnstile(token: string, secret: string, ip: string): Promise<boolean> {
+  try {
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `secret=${secret}&response=${token}&remoteip=${ip}`,
+    });
+    const result = await response.json<{ success: boolean }>();
+    return result.success === true;
+  } catch {
+    return false;
+  }
+}
+
+// --- Simple token-based verification for session-level ---
+const VERIFIED_TOKEN_TTL = 24 * 60 * 60 * 1000; // 24 hours (fallback for token validation)
+
+async function generateVerifiedToken(secret: string): Promise<string> {
+  const expires = Date.now() + VERIFIED_TOKEN_TTL;
+  const payload = `${expires}`;
+  
+  // 使用 HMAC-SHA256 进行签名
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(payload)
+  );
+  
+  // 转换为十六进制字符串
+  const signatureHex = Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+  
+  return `${payload}:${signatureHex}`;
+}
+
+async function isVerifiedTokenValid(token: string, secret: string): Promise<boolean> {
+  try {
+    const [expiresStr, signature] = token.split(':');
+    const expires = parseInt(expiresStr);
+    if (isNaN(expires) || Date.now() > expires) return false;
+    
+    // 使用 HMAC-SHA256 验证签名
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+    
+    // 将十六进制签名转换回字节数组
+    const signatureBytes = new Uint8Array(
+      signature.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
+    );
+    
+    return await crypto.subtle.verify(
+      'HMAC',
+      key,
+      signatureBytes,
+      new TextEncoder().encode(expiresStr)
+    );
+  } catch {
+    return false;
+  }
+}
+
+// --- UserDBDO helper ---
+function getUserDBStub(env: Env): DurableObjectStub {
+  const id = env.USER_DB.idFromName('global');
+  return env.USER_DB.get(id);
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // ==================== Auth Routes ====================
+
+    if (url.pathname === '/api/auth/github') {
+      return handleGitHubAuth(request, env);
+    }
+
+    if (url.pathname === '/api/auth/callback') {
+      return handleGitHubCallback(request, env);
+    }
+
+    if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
+      return handleLogout(request, env);
+    }
+
+    if (url.pathname === '/api/auth/me') {
+      return handleGetMe(request, env);
+    }
+
+    // ==================== Servers Routes (需认证) ====================
+
+    if (url.pathname === '/api/servers' || url.pathname.startsWith('/api/servers/')) {
+      return handleServersRoute(request, url, env);
+    }
+
+    // ==================== Turnstile Verify ====================
+
+    if (url.pathname === '/api/verify' && request.method === 'POST') {
+      if (!env.TURNSTILE_SECRET) {
+        return Response.json({ success: true });
+      }
+
+      const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+      const body = await request.json<{ token: string }>();
+      
+      if (!body.token) {
+        return Response.json({ success: false, error: 'Missing token' }, { status: 400 });
+      }
+
+      const isValid = await verifyTurnstile(body.token, env.TURNSTILE_SECRET, clientIP);
+      if (!isValid) {
+        return Response.json({ success: false, error: 'Invalid token' }, { status: 403 });
+      }
+
+      // Issue a verified token as a session cookie (no Max-Age = session cookie, expires when browser closes)
+      const verifiedToken = await generateVerifiedToken(env.TURNSTILE_SECRET);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': `cf_verified=${verifiedToken}; Path=/; HttpOnly; Secure; SameSite=Strict`,
+        },
+      });
+    }
+
+    // ==================== SSH WebSocket ====================
+
+    if (url.pathname === '/api/ssh') {
+      // Apply rate limiting (distributed via Durable Object)
+      const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+      if (await isDistributedRateLimited(env, clientIP)) {
+        return new Response('Too Many Requests', { status: 429 });
+      }
+
+      // Check for one-time-token (from server management connect)
+      const connectToken = url.searchParams.get('token');
+      if (connectToken) {
+        return handleTokenSSHConnection(request, env, connectToken);
+      }
+
+      // Verify Turnstile if secret is configured
+      if (env.TURNSTILE_SECRET) {
+        // Check if user has a valid verification cookie
+        const cookies = request.headers.get('Cookie') || '';
+        const verifiedCookie = cookies.split(';').find(c => c.trim().startsWith('cf_verified='));
+        const verifiedToken = verifiedCookie?.split('=')[1];
+
+        if (!verifiedToken || !await isVerifiedTokenValid(verifiedToken, env.TURNSTILE_SECRET)) {
+          // No valid cookie, check Turnstile token
+          const turnstileToken = url.searchParams.get('turnstile_token');
+          if (!turnstileToken) {
+            return Response.json({ error: 'Missing Turnstile token' }, { status: 403 });
+          }
+          const isValid = await verifyTurnstile(turnstileToken, env.TURNSTILE_SECRET, clientIP);
+          if (!isValid) {
+            return Response.json({ error: 'Turnstile verification failed' }, { status: 403 });
+          }
+        }
+      }
+
+      return handleSSHConnection(request, env);
+    }
+
+    if (url.pathname === '/api/health') {
+      return Response.json({ status: 'ok', timestamp: Date.now() });
+    }
+
+    // Return config info (includes GitHub auth availability)
+    if (url.pathname === '/api/config') {
+      return Response.json({
+        turnstileEnabled: !!env.TURNSTILE_SECRET,
+        sitekey: env.TURNSTILE_SITEKEY || '',
+        githubAuthEnabled: !!env.GITHUB_CLIENT_ID,
+      });
+    }
+
+    return new Response(HTML, {
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
+      }
+    });
+  },
+};
+
+// ==================== Server management routes ====================
+
+async function handleServersRoute(request: Request, url: URL, env: Env): Promise<Response> {
+  // 认证检查
+  const user = await getAuthenticatedUser(request, env);
+  if (!user) {
+    return Response.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  const stub = getUserDBStub(env);
+
+  // GET /api/servers
+  if (url.pathname === '/api/servers' && request.method === 'GET') {
+    return stub.fetch(new Request(`http://internal/internal/servers?user_id=${user.id}`, {
+      method: 'GET',
+    }));
+  }
+
+  // POST /api/servers
+  if (url.pathname === '/api/servers' && request.method === 'POST') {
+    const body = await request.json<Record<string, unknown>>();
+    body.user_id = user.id;
+    return stub.fetch(new Request('http://internal/internal/servers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+  }
+
+  // /api/servers/:id/connect
+  const connectMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/connect$/);
+  if (connectMatch && request.method === 'POST') {
+    const serverId = connectMatch[1];
+    const tokenRes = await stub.fetch(new Request(`http://internal/internal/servers/${serverId}/connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: user.id }),
+    }));
+
+    if (!tokenRes.ok) return tokenRes;
+
+    const { token } = await tokenRes.json<{ token: string }>();
+    const wsProtocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${url.host}/api/ssh?token=${token}`;
+
+    return Response.json({ wsUrl });
+  }
+
+  // /api/servers/:id
+  const serverMatch = url.pathname.match(/^\/api\/servers\/(\d+)$/);
+  if (serverMatch) {
+    const serverId = serverMatch[1];
+
+    // PUT /api/servers/:id
+    if (request.method === 'PUT') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(new Request(`http://internal/internal/servers/${serverId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }));
+    }
+
+    // DELETE /api/servers/:id
+    if (request.method === 'DELETE') {
+      return stub.fetch(new Request(`http://internal/internal/servers/${serverId}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.id }),
+      }));
+    }
+  }
+
+  return Response.json({ error: 'Not Found' }, { status: 404 });
+}
+
+// ==================== SSH connection handlers ====================
+
+async function handleSSHConnection(request: Request, env: Env): Promise<Response> {
+  const upgradeHeader = request.headers.get('Upgrade');
+  if (upgradeHeader !== 'websocket') {
+    return Response.json(
+      { error: 'Expected WebSocket upgrade' },
+      { status: 426 }
+    );
+  }
+
+  // Prevent Cross-Site WebSocket Hijacking / Quota Leeching
+  const origin = request.headers.get('Origin');
+  if (origin) {
+    const url = new URL(request.url);
+    if (origin !== url.origin) {
+      return new Response('Forbidden', { status: 403 });
+    }
+  }
+
+  const doId = env.SSH_SESSION.idFromName(`session:${Date.now()}:${Math.random()}`);
+  const stub = env.SSH_SESSION.get(doId);
+
+  return stub.fetch(request);
+}
+
+/**
+ * 处理通过 one-time-token 发起的 SSH 连接
+ * 流程：从 UserDBDO 消费 token 获取凭据 → 传给 SSHSessionDO
+ */
+async function handleTokenSSHConnection(request: Request, env: Env, token: string): Promise<Response> {
+  const upgradeHeader = request.headers.get('Upgrade');
+  if (upgradeHeader !== 'websocket') {
+    return Response.json({ error: 'Expected WebSocket upgrade' }, { status: 426 });
+  }
+
+  // Prevent Cross-Site WebSocket Hijacking
+  const origin = request.headers.get('Origin');
+  if (origin) {
+    const url = new URL(request.url);
+    if (origin !== url.origin) {
+      return new Response('Forbidden', { status: 403 });
+    }
+  }
+
+  // 从 UserDBDO 消费 token，获取连接配置
+  const stub = getUserDBStub(env);
+  const tokenRes = await stub.fetch(new Request('http://internal/internal/connect-token/consume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  }));
+
+  if (!tokenRes.ok) {
+    return Response.json({ error: 'Invalid or expired connection token' }, { status: 403 });
+  }
+
+  const config = await tokenRes.json<SSHConnectionConfig>();
+
+  // 将凭据编码后通过 URL 参数传给 SSHSessionDO（内部通信，不经过前端）
+  const configBase64 = btoa(JSON.stringify(config));
+
+  const doId = env.SSH_SESSION.idFromName(`session:${Date.now()}:${Math.random()}`);
+  const doStub = env.SSH_SESSION.get(doId);
+
+  // 构建新的请求 URL，附加预填充配置
+  const doUrl = new URL(request.url);
+  doUrl.searchParams.delete('token');
+  doUrl.searchParams.set('config', configBase64);
+
+  const doRequest = new Request(doUrl.toString(), {
+    headers: request.headers,
+  });
+
+  return doStub.fetch(doRequest);
+}

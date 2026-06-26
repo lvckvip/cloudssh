@@ -1,0 +1,549 @@
+import { Env, UserInfo, ServerConfig, SSHConnectionConfig } from '../types';
+
+/**
+ * UserDBDO — 用户数据库 Durable Object（全局单例）
+ *
+ * 职责：
+ * - 用户管理（GitHub OAuth 登录后创建/更新）
+ * - Session 管理（创建/验证/清除）
+ * - 服务器配置 CRUD（含 AES-256-GCM 凭据加密）
+ * - One-time-token 生成与消费（安全传递凭据）
+ */
+export class UserDBDO {
+  private state: DurableObjectState;
+  private env: Env;
+  private db: any; // SqlStorage (DO SQLite)
+  // one-time-token 内存存储：token → { config, expiresAt }
+  private connectTokens: Map<string, { config: SSHConnectionConfig; expiresAt: number }> = new Map();
+  private static readonly MAX_CONNECT_TOKENS = 1000;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+    this.db = (state.storage as any).sql;
+    this.initSchema();
+  }
+
+  private initSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS system_config (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        github_id   INTEGER UNIQUE NOT NULL,
+        username    TEXT NOT NULL,
+        avatar_url  TEXT,
+        created_at  TEXT DEFAULT (datetime('now')),
+        updated_at  TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        token       TEXT PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id),
+        expires_at  TEXT NOT NULL,
+        created_at  TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS servers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL REFERENCES users(id),
+        name        TEXT NOT NULL,
+        host        TEXT NOT NULL,
+        port        INTEGER DEFAULT 22,
+        username    TEXT NOT NULL,
+        credential  TEXT NOT NULL,
+        auth_method TEXT DEFAULT 'password',
+        created_at  TEXT DEFAULT (datetime('now')),
+        updated_at  TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_servers_user ON servers(user_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+      CREATE TABLE IF NOT EXISTS rate_limits (
+        ip          TEXT PRIMARY KEY,
+        count       INTEGER NOT NULL DEFAULT 1,
+        reset_time  TEXT NOT NULL,
+        created_at  TEXT DEFAULT (datetime('now'))
+      );
+    `);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    try {
+      // --- 用户管理 ---
+      if (path === '/internal/oauth-user' && request.method === 'POST') {
+        return this.handleOAuthUser(request);
+      }
+
+      // --- Session 管理 ---
+      if (path === '/internal/session/create' && request.method === 'POST') {
+        return this.handleSessionCreate(request);
+      }
+      if (path === '/internal/session/verify' && request.method === 'POST') {
+        return this.handleSessionVerify(request);
+      }
+      if (path === '/internal/session/delete' && request.method === 'POST') {
+        return this.handleSessionDelete(request);
+      }
+
+      // --- 服务器 CRUD ---
+      if (path === '/internal/servers' && request.method === 'GET') {
+        const userId = url.searchParams.get('user_id');
+        if (!userId) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        return this.handleGetServers(parseInt(userId));
+      }
+      if (path === '/internal/servers' && request.method === 'POST') {
+        return this.handleAddServer(request);
+      }
+
+      // /internal/servers/:id
+      const serverMatch = path.match(/^\/internal\/servers\/(\d+)$/);
+      if (serverMatch) {
+        const serverId = parseInt(serverMatch[1]);
+        if (request.method === 'PUT') return this.handleUpdateServer(serverId, request);
+        if (request.method === 'DELETE') return this.handleDeleteServer(serverId, request);
+      }
+
+      // /internal/servers/:id/connect
+      const connectMatch = path.match(/^\/internal\/servers\/(\d+)\/connect$/);
+      if (connectMatch && request.method === 'POST') {
+        return this.handleConnectServer(parseInt(connectMatch[1]), request);
+      }
+
+      // --- One-time-token 消费 ---
+      if (path === '/internal/connect-token/consume' && request.method === 'POST') {
+        return this.handleConsumeToken(request);
+      }
+
+      // --- 速率限制检查 ---
+      if (path === '/internal/rate-limit/check' && request.method === 'POST') {
+        return this.handleRateLimitCheck(request);
+      }
+
+      return Response.json({ error: 'Not Found' }, { status: 404 });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return Response.json({ error: msg }, { status: 500 });
+    }
+  }
+
+  // ==================== 用户管理 ====================
+
+  private async handleOAuthUser(request: Request): Promise<Response> {
+    const { github_id, username, avatar_url } = await request.json<{
+      github_id: number;
+      username: string;
+      avatar_url: string;
+    }>();
+
+    // Upsert 用户
+    const existing = this.db
+      .exec('SELECT id, github_id, username, avatar_url FROM users WHERE github_id = ?', github_id)
+      .toArray();
+
+    if (existing.length > 0) {
+      // 更新用户信息
+      this.db.exec(
+        "UPDATE users SET username = ?, avatar_url = ?, updated_at = datetime('now') WHERE github_id = ?",
+        username,
+        avatar_url,
+        github_id
+      );
+      const user = existing[0] as unknown as UserInfo;
+      user.username = username;
+      user.avatar_url = avatar_url;
+      return Response.json(user);
+    }
+
+    // 新建用户
+    this.db.exec(
+      'INSERT INTO users (github_id, username, avatar_url) VALUES (?, ?, ?)',
+      github_id,
+      username,
+      avatar_url
+    );
+
+    const newUser = this.db
+      .exec('SELECT id, github_id, username, avatar_url FROM users WHERE github_id = ?', github_id)
+      .toArray()[0] as unknown as UserInfo;
+
+    return Response.json(newUser);
+  }
+
+  // ==================== Session 管理 ====================
+
+  private async handleSessionCreate(request: Request): Promise<Response> {
+    const { user_id } = await request.json<{ user_id: number }>();
+
+    // 生成随机 token
+    const tokenBytes = new Uint8Array(32);
+    crypto.getRandomValues(tokenBytes);
+    const token = Array.from(tokenBytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    // 7 天过期
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    this.db.exec('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)', token, user_id, expiresAt);
+
+    // 清理该用户的过期 session
+    this.db.exec("DELETE FROM sessions WHERE user_id = ? AND expires_at < datetime('now')", user_id);
+
+    return Response.json({ token, expires_at: expiresAt });
+  }
+
+  private async handleSessionVerify(request: Request): Promise<Response> {
+    const { token } = await request.json<{ token: string }>();
+
+    const rows = this.db
+      .exec(
+        `SELECT u.id, u.github_id, u.username, u.avatar_url
+         FROM sessions s JOIN users u ON s.user_id = u.id
+         WHERE s.token = ? AND s.expires_at > datetime('now')`,
+        token
+      )
+      .toArray();
+
+    if (rows.length === 0) {
+      return Response.json({ error: 'Invalid or expired session' }, { status: 401 });
+    }
+
+    return Response.json(rows[0] as unknown as UserInfo);
+  }
+
+  private async handleSessionDelete(request: Request): Promise<Response> {
+    const { token } = await request.json<{ token: string }>();
+    this.db.exec('DELETE FROM sessions WHERE token = ?', token);
+    return Response.json({ success: true });
+  }
+
+  // ==================== 服务器 CRUD ====================
+
+  private handleGetServers(userId: number): Response {
+    const rows = this.db
+      .exec(
+        `SELECT id, user_id, name, host, port, username, auth_method, created_at, updated_at
+         FROM servers WHERE user_id = ? ORDER BY updated_at DESC`,
+        userId
+      )
+      .toArray();
+
+    return Response.json(rows as unknown as ServerConfig[]);
+  }
+
+  private async handleAddServer(request: Request): Promise<Response> {
+    const body = await request.json<{
+      user_id: number;
+      name: string;
+      host: string;
+      port: number;
+      username: string;
+      credential: string;
+      auth_method: string;
+    }>();
+
+    // 加密凭据
+    const encrypted = await this.encryptCredential(body.credential, body.user_id);
+
+    this.db.exec(
+      'INSERT INTO servers (user_id, name, host, port, username, credential, auth_method) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      body.user_id,
+      body.name,
+      body.host,
+      body.port || 22,
+      body.username,
+      encrypted,
+      body.auth_method || 'password'
+    );
+
+    // 获取新创建的记录
+    const rows = this.db
+      .exec(
+        `SELECT id, user_id, name, host, port, username, auth_method, created_at, updated_at
+         FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
+        body.user_id
+      )
+      .toArray();
+
+    return Response.json(rows[0] as unknown as ServerConfig, { status: 201 });
+  }
+
+  private async handleUpdateServer(serverId: number, request: Request): Promise<Response> {
+    const body = await request.json<{
+      user_id: number;
+      name?: string;
+      host?: string;
+      port?: number;
+      username?: string;
+      credential?: string;
+      auth_method?: string;
+    }>();
+
+    // 验证服务器属于该用户
+    const existing = this.db.exec('SELECT user_id FROM servers WHERE id = ?', serverId).toArray();
+    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
+    if ((existing[0] as unknown as { user_id: number }).user_id !== body.user_id)
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+
+    // 构建更新语句
+    const updates: string[] = [];
+    const values: (string | number)[] = [];
+
+    if (body.name !== undefined) {
+      updates.push('name = ?');
+      values.push(body.name);
+    }
+    if (body.host !== undefined) {
+      updates.push('host = ?');
+      values.push(body.host);
+    }
+    if (body.port !== undefined) {
+      updates.push('port = ?');
+      values.push(body.port);
+    }
+    if (body.username !== undefined) {
+      updates.push('username = ?');
+      values.push(body.username);
+    }
+    if (body.credential !== undefined) {
+      const encrypted = await this.encryptCredential(body.credential, body.user_id);
+      updates.push('credential = ?');
+      values.push(encrypted);
+    }
+    if (body.auth_method !== undefined) {
+      updates.push('auth_method = ?');
+      values.push(body.auth_method);
+    }
+
+    if (updates.length > 0) {
+      updates.push("updated_at = datetime('now')");
+      values.push(serverId);
+      this.db.exec(`UPDATE servers SET ${updates.join(', ')} WHERE id = ?`, ...values);
+    }
+
+    const row = this.db
+      .exec(
+        `SELECT id, user_id, name, host, port, username, auth_method, created_at, updated_at
+         FROM servers WHERE id = ?`,
+        serverId
+      )
+      .toArray();
+
+    return Response.json(row[0] as unknown as ServerConfig);
+  }
+
+  private async handleDeleteServer(serverId: number, request: Request): Promise<Response> {
+    const body = await request.json<{ user_id: number }>();
+
+    // 验证服务器属于该用户
+    const existing = this.db.exec('SELECT user_id FROM servers WHERE id = ?', serverId).toArray();
+    if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
+    if ((existing[0] as unknown as { user_id: number }).user_id !== body.user_id)
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+
+    this.db.exec('DELETE FROM servers WHERE id = ?', serverId);
+    return Response.json({ success: true });
+  }
+
+  // ==================== One-time-token 连接 ====================
+
+  private async handleConnectServer(serverId: number, request: Request): Promise<Response> {
+    const body = await request.json<{ user_id: number }>();
+
+    // 验证服务器属于该用户
+    const rows = this.db.exec('SELECT * FROM servers WHERE id = ? AND user_id = ?', serverId, body.user_id).toArray();
+    if (rows.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
+
+    const server = rows[0] as unknown as {
+      id: number; user_id: number; name: string; host: string;
+      port: number; username: string; credential: string; auth_method: string;
+    };
+
+    // 解密凭据
+    const credential = await this.decryptCredential(server.credential, body.user_id);
+
+    // 生成 one-time-token
+    const token = crypto.randomUUID();
+    const config: SSHConnectionConfig = {
+      host: server.host,
+      port: server.port,
+      username: server.username,
+      password: server.auth_method === 'password' ? credential : '',
+      authMethod: server.auth_method === 'publickey' ? 'publickey' : 'password',
+      privateKey: server.auth_method === 'publickey' ? credential : '',
+    };
+
+    // 防止 token 数量无限增长
+    if (this.connectTokens.size >= UserDBDO.MAX_CONNECT_TOKENS) {
+      this.cleanExpiredTokens();
+      if (this.connectTokens.size >= UserDBDO.MAX_CONNECT_TOKENS) {
+        return Response.json({ error: 'Too many pending connections' }, { status: 429 });
+      }
+    }
+
+    // 存入内存，60 秒过期
+    this.connectTokens.set(token, {
+      config,
+      expiresAt: Date.now() + 60_000,
+    });
+
+    return Response.json({ token });
+  }
+
+  private async handleConsumeToken(request: Request): Promise<Response> {
+    const { token } = await request.json<{ token: string }>();
+
+    const entry = this.connectTokens.get(token);
+    if (!entry) return Response.json({ error: 'Invalid or expired token' }, { status: 404 });
+
+    // 立即删除（一次性）
+    this.connectTokens.delete(token);
+
+    if (Date.now() > entry.expiresAt) {
+      return Response.json({ error: 'Token expired' }, { status: 410 });
+    }
+
+    return Response.json(entry.config);
+  }
+
+  private cleanExpiredTokens(): void {
+    const now = Date.now();
+    for (const [key, value] of this.connectTokens) {
+      if (now > value.expiresAt) {
+        this.connectTokens.delete(key);
+      }
+    }
+  }
+
+  // ==================== 凭据加密 ====================
+
+  /**
+   * AES-256-GCM 加密凭据
+   * 密钥派生：PBKDF2(SESSION_SECRET, salt="cloudssh:userdb:" + user_id)
+   * 存储格式：base64(iv + ciphertext + tag)
+   */
+  private async encryptCredential(plaintext: string, userId: number): Promise<string> {
+    const key = await this.deriveEncryptionKey(userId);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(plaintext);
+
+    const ciphertext = new Uint8Array(
+      await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded)
+    );
+
+    // iv (12) + ciphertext+tag
+    const combined = new Uint8Array(iv.length + ciphertext.length);
+    combined.set(iv, 0);
+    combined.set(ciphertext, iv.length);
+
+    return btoa(String.fromCharCode(...combined));
+  }
+
+  private async decryptCredential(stored: string, userId: number): Promise<string> {
+    const key = await this.deriveEncryptionKey(userId);
+    const raw = Uint8Array.from(atob(stored), (c) => c.charCodeAt(0));
+    const iv = raw.slice(0, 12);
+    const ciphertext = raw.slice(12);
+
+    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+    return new TextDecoder().decode(decrypted);
+  }
+
+  private async deriveEncryptionKey(userId: number): Promise<CryptoKey> {
+    let secret = this.env.SESSION_SECRET;
+
+    // 如果环境变量未设置，则尝试从数据库读取自动生成的密钥，若没有则自动生成并保存
+    if (!secret) {
+      const rows = this.db.exec("SELECT value FROM system_config WHERE key = 'session_secret'").toArray();
+      if (rows.length > 0) {
+        secret = rows[0].value as string;
+      } else {
+        const bytes = new Uint8Array(32);
+        crypto.getRandomValues(bytes);
+        secret = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        this.db.exec("INSERT INTO system_config (key, value) VALUES ('session_secret', ?)", secret);
+      }
+    }
+
+    const salt = new TextEncoder().encode(`cloudssh:userdb:${userId}`);
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      'PBKDF2',
+      false,
+      ['deriveKey']
+    );
+
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  // ==================== 速率限制 ====================
+
+  private async handleRateLimitCheck(request: Request): Promise<Response> {
+    const { ip, maxRequests, windowMs } = await request.json<{
+      ip: string;
+      maxRequests: number;
+      windowMs: number;
+    }>();
+
+    if (!ip) {
+      return Response.json({ error: 'Missing IP address' }, { status: 400 });
+    }
+
+    const now = new Date();
+    const resetTime = new Date(now.getTime() + windowMs).toISOString();
+
+    // 查询当前IP的速率限制记录
+    const rows = this.db.exec(
+      'SELECT count, reset_time FROM rate_limits WHERE ip = ?',
+      ip
+    ).toArray();
+
+    if (rows.length === 0) {
+      // 新IP，创建记录
+      this.db.exec(
+        'INSERT INTO rate_limits (ip, count, reset_time) VALUES (?, 1, ?)',
+        ip,
+        resetTime
+      );
+      return Response.json({ limited: false });
+    }
+
+    const row = rows[0] as unknown as { count: number; reset_time: string };
+    const resetTimeDb = new Date(row.reset_time);
+    
+    if (now > resetTimeDb) {
+      // 窗口已过期，重置计数器
+      this.db.exec(
+        'UPDATE rate_limits SET count = 1, reset_time = ? WHERE ip = ?',
+        resetTime,
+        ip
+      );
+      return Response.json({ limited: false });
+    }
+
+    // 窗口内，增加计数器
+    const newCount = row.count + 1;
+    this.db.exec(
+      'UPDATE rate_limits SET count = ? WHERE ip = ?',
+      newCount,
+      ip
+    );
+
+    return Response.json({ limited: newCount > maxRequests });
+  }
+}
